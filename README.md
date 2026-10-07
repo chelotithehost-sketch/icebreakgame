@@ -10,3 +10,12 @@ Round 3, Reveal: the host opens tickets one at a time, and each shows the questi
 Round 4, Winners: the tickets with the most laughs are shown as the top 3, followed by the rest.
 
 The host never plays. They run the timer, lock or open the doors, deal the tickets, open the tickets one by one, and can skip an unsuitable one. A full run with a small team takes about 15 minutes.
+
+How to run it:
+
+On share.streamlit.io, click "Create app", pick this repo, and set the main file to app.py.
+Under "Advanced settings → Secrets", add HOST_PIN = "your-pin". 
+Without it, the PIN defaults to 1234.
+Open the link a few minutes before the game, because free apps sleep when idle. 
+Share the same link with everyone.
+
