@@ -119,6 +119,21 @@ class Game:
             else:
                 self.phase = "final"
 
+    def back(self):
+        """Host rescue: step one phase backwards."""
+        with self.lock:
+            if self.phase == "final":
+                self.phase = "reveal"
+            elif self.phase == "reveal":
+                self.reveal_n = 0
+                self.phase = "answer"
+            elif self.phase == "answer":
+                for e in self.entries.values():
+                    e["answerer"] = None
+                    e["answer"] = ""
+                self.phase = "write"
+            self.deadline = None
+
     def start_timer(self, minutes):
         with self.lock:
             self.deadline = time.time() + minutes * 60
@@ -159,11 +174,11 @@ class Game:
 
 
 @st.cache_resource
-def get_game():
+def get_game(version=2):
     return Game()
 
 
-game = get_game()
+game = get_game(2)
 
 
 def host_pin():
@@ -180,11 +195,14 @@ CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Bungee&family=DM+Sans:wght@400;500;700&display=swap');
 
-html, body, [class*="st-"], .stApp { font-family: 'DM Sans', system-ui, sans-serif; }
-.block-container { max-width: 720px; padding-top: 1.6rem; padding-bottom: 4rem; }
+html, body, .stApp, .stApp p, .stApp label, .stApp input, .stApp textarea, .stApp h3 {
+  font-family: 'DM Sans', system-ui, sans-serif; }
+[data-testid="stIconMaterial"], .material-symbols-rounded, .material-icons {
+  font-family: 'Material Symbols Rounded', 'Material Icons' !important; }
+.block-container { max-width: 720px; padding-top: 4.5rem; padding-bottom: 4rem; }
 #MainMenu, footer { visibility: hidden; }
 
-.title { font-family: 'Bungee', sans-serif; font-size: clamp(2rem, 8vw, 3rem);
+.title { font-family: 'Bungee', 'Arial Black', Impact, sans-serif; font-size: clamp(2rem, 8vw, 3rem);
          line-height: 1; margin: 0; color: #fdf3dc; letter-spacing: .01em; }
 .tagline { color: #bdb6e6; margin: .35rem 0 1.1rem 0; }
 
@@ -194,14 +212,14 @@ html, body, [class*="st-"], .stApp { font-family: 'DM Sans', system-ui, sans-ser
 .step.on { background: #fdf3dc; color: #1b1840; font-weight: 700; }
 .step.past { background: #3a3585; color: #fdf3dc; }
 
-.timer { font-family: 'Bungee', sans-serif; font-size: 1.5rem; color: #ffd166;
+.timer { font-family: 'Bungee', 'Arial Black', Impact, sans-serif; font-size: 1.5rem; color: #ffd166;
          text-align: center; margin: .3rem 0 1rem 0; }
 
 /* ticket stubs */
 .ticket { position: relative; display: flex; background: #fdf3dc; color: #1b1840;
           border-radius: 10px; margin: 0 0 1rem 0; overflow: hidden; }
 .ticket .stub { flex: 0 0 96px; display: flex; align-items: center; justify-content: center;
-                background: #e8452a; color: #fff; font-family: 'Bungee', sans-serif;
+                background: #e8452a; color: #fff; font-family: 'Bungee', 'Arial Black', Impact, sans-serif;
                 font-size: 1.6rem; padding: 1rem .4rem; border-right: 3px dashed #1b1840; }
 .ticket .body { flex: 1 1 auto; padding: .9rem 1.1rem; min-width: 0; }
 .ticket .q { font-weight: 700; font-size: 1.1rem; line-height: 1.3; overflow-wrap: anywhere; }
@@ -215,15 +233,15 @@ html, body, [class*="st-"], .stApp { font-family: 'DM Sans', system-ui, sans-ser
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 10px; margin: .6rem 0 1.2rem 0; }
 .tile { background: #2a2660; border: 2px dashed #5b55b0; border-radius: 10px; color: #bdb6e6;
         text-align: center; padding: .6rem .2rem; }
-.tile .n { display: block; font-family: 'Bungee', sans-serif; font-size: 1.15rem; }
+.tile .n { display: block; font-family: 'Bungee', 'Arial Black', Impact, sans-serif; font-size: 1.15rem; }
 .tile .s { display: block; font-size: .78rem; margin-top: .1rem; }
 .tile.mine { background: #fdf3dc; color: #1b1840; border: 2px solid #ffd166; }
 .tile.done { background: #1e5b57; border-color: #2ec4b6; color: #e6fffb; }
 
-.bignum { font-family: 'Bungee', sans-serif; font-size: clamp(3rem, 16vw, 5.5rem); color: #fdf3dc;
+.bignum { font-family: 'Bungee', 'Arial Black', Impact, sans-serif; font-size: clamp(3rem, 16vw, 5.5rem); color: #fdf3dc;
           text-align: center; line-height: 1; margin: .4rem 0; }
 .hint { color: #bdb6e6; font-size: .92rem; }
-.podium { font-family: 'Bungee', sans-serif; font-size: 1.4rem; margin: 1.2rem 0 .5rem 0; color: #ffd166; }
+.podium { font-family: 'Bungee', 'Arial Black', Impact, sans-serif; font-size: 1.4rem; margin: 1.2rem 0 .5rem 0; color: #ffd166; }
 .waiting { text-align: center; color: #bdb6e6; padding: 2rem 0; }
 
 @media (max-width: 480px) {
@@ -471,7 +489,7 @@ def view_final():
 # Host controls
 # --------------------------------------------------------------------------- #
 def host_panel():
-    with st.expander("🎛️ Host controls"):
+    with st.expander("🎛️ Host controls", expanded=bool(st.session_state.get("is_host"))):
         if not st.session_state.get("is_host"):
             with st.form("pin_form"):
                 pin = st.text_input("Host PIN", type="password")
@@ -483,8 +501,9 @@ def host_panel():
                         st.error("Wrong PIN.")
             return
 
-        st.caption("You are the host.")
         phase = game.phase
+        label = dict(PHASES)[phase]
+        st.caption(f"You are the host. Current round: **{label}**")
 
         if phase in ("write", "answer"):
             c1, c2 = st.columns([1, 1])
@@ -515,6 +534,18 @@ def host_panel():
                 st.caption("Still answering: " + ", ".join(waiting))
             if st.button("Start the reveal", type="primary", use_container_width=True):
                 game.start_reveal()
+                st.rerun()
+
+        elif phase == "reveal":
+            total, n = len(game.order), game.reveal_n
+            btn = f"👀 Open next ticket ({n}/{total})" if n < total else "🏆 Show the winners"
+            if st.button(btn, type="primary", use_container_width=True, key="host_reveal_next"):
+                game.reveal_next()
+                st.rerun()
+
+        if phase != "write":
+            if st.button("↩ Go back one round", use_container_width=True):
+                game.back()
                 st.rerun()
 
         st.divider()
@@ -570,3 +601,4 @@ if c2.button("Not you?", use_container_width=True):
     st.rerun()
 
 host_panel()
+
