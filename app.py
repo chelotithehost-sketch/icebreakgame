@@ -1,10 +1,14 @@
 """
 Iffy Business - a team icebreaker for laughs.
 
-1. WRITE   Everyone draws a raffle number (1-999) and writes an "If..." question.
-2. ANSWER  The questions are hidden. Everyone gets someone else's ticket and answers it blind.
-3. REVEAL  The host opens the tickets one by one: question + answer. Everyone reacts.
-4. WINNERS The funniest tickets win.
+PLAYERS  open the app link, enter a name and play:
+  1. WRITE   draw a raffle number (1-999) and write an "If..." question
+  2. ANSWER  questions are hidden; everyone answers someone else's ticket blind
+  3. REVEAL  tickets are opened one by one, everyone reacts with a laugh
+  4. WINNERS the funniest tickets win
+
+THE HOST  is not a player. Open the app link with  ?mode=host  (or press "Host login"
+on the join screen), enter the host PIN and run the game from the dashboard.
 
 Shared game state lives in server memory (st.cache_resource), so everyone who opens
 the same link plays the same game. A restart of the app resets the game.
@@ -20,6 +24,10 @@ import streamlit as st
 st.set_page_config(page_title="Iffy Business", page_icon="🎟️", layout="centered")
 
 MAX_LEN = 140
+LOCK_MSG = (
+    "🔒 The game has already started, so new players can't join right now. "
+    "Please wait for the next round. The host will open the doors again."
+)
 IDEAS = [
     "If our manager became a pirate?",
     "If Monday had a mascot?",
@@ -44,22 +52,46 @@ class Game:
     def reset(self):
         with self.lock:
             self.phase = "write"
-            self.players = {}   # key -> display name
-            self.entries = {}   # author key -> entry dict
-            self.order = []     # reveal order (author keys)
+            self.players = {}        # key -> display name
+            self.entries = {}        # author key -> entry dict
+            self.order = []          # reveal order (author keys)
             self.reveal_n = 0
-            self.deadline = None
+            self.deadline = None     # unix time when the countdown ends
+            self.locked = False      # True = new players cannot join
+            self.auto_advance = False
+            self.notice = ""
+            self.kicked = set()      # players removed by the host
 
     # -- players ---------------------------------------------------------- #
     @staticmethod
     def key_of(name):
         return " ".join(name.lower().split())
 
+    def can_join(self, name):
+        with self.lock:
+            key = self.key_of(name)
+            if key in self.kicked:
+                return False
+            return (not self.locked) or key in self.players
+
     def join(self, name):
         key = self.key_of(name)
         with self.lock:
+            if key in self.kicked or (self.locked and key not in self.players):
+                return None
             self.players[key] = " ".join(name.split())
         return key
+
+    def remove_player(self, key):
+        with self.lock:
+            if self.phase == "write":
+                self.players.pop(key, None)
+                self.entries.pop(key, None)
+                self.kicked.add(key)
+
+    def set_locked(self, value):
+        with self.lock:
+            self.locked = value
 
     # -- write phase ------------------------------------------------------ #
     def draw_number(self, key):
@@ -89,9 +121,15 @@ class Game:
             if self.phase == "write" and entry and text.strip():
                 entry["question"] = text.strip()[:MAX_LEN]
 
+    def clear_question(self, key):
+        with self.lock:
+            entry = self.entries.get(key)
+            if self.phase == "write" and entry:
+                entry["question"] = ""
+
     # -- phase changes ---------------------------------------------------- #
-    def start_answer(self):
-        """Deal tickets: every writer answers exactly one ticket that is not theirs."""
+    def deal(self):
+        """Give every writer exactly one ticket that is not their own (wipes any answers)."""
         with self.lock:
             self.entries = {k: e for k, e in self.entries.items() if e["question"]}
             keys = list(self.entries)
@@ -99,9 +137,19 @@ class Game:
                 return False
             random.shuffle(keys)
             for i, k in enumerate(keys):
-                self.entries[k]["answerer"] = keys[(i + 1) % len(keys)]
+                e = self.entries[k]
+                e["answerer"] = keys[(i + 1) % len(keys)]
+                e["answer"] = ""
+            return True
+
+    def start_answer(self):
+        with self.lock:
+            if not self.deal():
+                return False
             self.phase = "answer"
+            self.locked = True       # no latecomers once tickets are dealt
             self.deadline = None
+            self.notice = ""
             return True
 
     def start_reveal(self):
@@ -111,6 +159,16 @@ class Game:
             self.reveal_n = 0
             self.phase = "reveal"
             self.deadline = None
+            self.notice = ""
+
+    def advance(self):
+        with self.lock:
+            if self.phase == "write":
+                return self.start_answer()
+            if self.phase == "answer":
+                self.start_reveal()
+                return True
+            return False
 
     def reveal_next(self):
         with self.lock:
@@ -120,7 +178,7 @@ class Game:
                 self.phase = "final"
 
     def back(self):
-        """Host rescue: step one phase backwards."""
+        """Host rescue: step one round backwards."""
         with self.lock:
             if self.phase == "final":
                 self.phase = "reveal"
@@ -133,10 +191,21 @@ class Game:
                     e["answer"] = ""
                 self.phase = "write"
             self.deadline = None
+            self.notice = ""
 
+    # -- timer ------------------------------------------------------------ #
     def start_timer(self, minutes):
         with self.lock:
             self.deadline = time.time() + minutes * 60
+
+    def add_time(self, seconds):
+        with self.lock:
+            base = max(self.deadline or 0, time.time())
+            self.deadline = base + seconds
+
+    def stop_timer(self):
+        with self.lock:
+            self.deadline = None
 
     # -- answer phase ----------------------------------------------------- #
     def ticket_for(self, key):
@@ -170,15 +239,15 @@ class Game:
 
     def snapshot(self):
         with self.lock:
-            return (self.phase, self.reveal_n)
+            return (self.phase, self.reveal_n, self.locked)
 
 
 @st.cache_resource
-def get_game(version=2):
+def get_game(version=3):
     return Game()
 
 
-game = get_game(2)
+game = get_game(3)
 
 
 def host_pin():
@@ -238,11 +307,15 @@ html, body, .stApp, .stApp p, .stApp label, .stApp input, .stApp textarea, .stAp
 .tile.mine { background: #fdf3dc; color: #1b1840; border: 2px solid #ffd166; }
 .tile.done { background: #1e5b57; border-color: #2ec4b6; color: #e6fffb; }
 
-.bignum { font-family: 'Bungee', 'Arial Black', Impact, sans-serif; font-size: clamp(3rem, 16vw, 5.5rem); color: #fdf3dc;
-          text-align: center; line-height: 1; margin: .4rem 0; }
-.hint { color: #bdb6e6; font-size: .92rem; }
-.podium { font-family: 'Bungee', 'Arial Black', Impact, sans-serif; font-size: 1.4rem; margin: 1.2rem 0 .5rem 0; color: #ffd166; }
+.bignum { font-family: 'Bungee', 'Arial Black', Impact, sans-serif; font-size: clamp(3rem, 16vw, 5.5rem);
+          color: #fdf3dc; text-align: center; line-height: 1; margin: .4rem 0; }
+.podium { font-family: 'Bungee', 'Arial Black', Impact, sans-serif; font-size: 1.4rem;
+          margin: 1.2rem 0 .5rem 0; color: #ffd166; }
 .waiting { text-align: center; color: #bdb6e6; padding: 2rem 0; }
+.lockbox { background: #2a2660; border: 2px dashed #ffd166; border-radius: 12px; padding: 1.4rem 1.2rem;
+           text-align: center; color: #fdf3dc; line-height: 1.5; margin: 1rem 0; }
+.hostbadge { display: inline-block; background: #ffd166; color: #1b1840; font-weight: 700;
+             border-radius: 6px; padding: .1rem .6rem; font-size: .85rem; margin-bottom: .4rem; }
 
 @media (max-width: 480px) {
   .ticket .stub { flex-basis: 76px; font-size: 1.25rem; }
@@ -272,14 +345,17 @@ def ticket_html(entry, show_answer=True, show_names=True, mini=False):
 
 
 # --------------------------------------------------------------------------- #
-# Reusable pieces
+# Shared pieces
 # --------------------------------------------------------------------------- #
-def header():
+def header(host=False):
+    if host:
+        st.markdown('<span class="hostbadge">HOST</span>', unsafe_allow_html=True)
     st.markdown('<p class="title">Iffy Business</p>', unsafe_allow_html=True)
-    st.markdown(
-        '<p class="tagline">Write an “If…” question. Answer someone else’s blind. Laugh at the result.</p>',
-        unsafe_allow_html=True,
-    )
+    if not host:
+        st.markdown(
+            '<p class="tagline">Write an “If…” question. Answer someone else’s blind. Laugh at the result.</p>',
+            unsafe_allow_html=True,
+        )
     idx = [p for p, _ in PHASES].index(game.phase)
     pills = []
     for i, (_, label) in enumerate(PHASES):
@@ -290,7 +366,7 @@ def header():
 
 @st.fragment(run_every=2)
 def watcher():
-    """Re-runs the whole page when the host changes the phase or reveals a ticket."""
+    """Re-runs the whole page when the phase, reveal or door lock changes."""
     if game.snapshot() != st.session_state.get("snap"):
         st.rerun()
 
@@ -305,11 +381,66 @@ def countdown():
         m, s = divmod(left, 60)
         st.markdown(f'<div class="timer">⏳ {m:02d}:{s:02d}</div>', unsafe_allow_html=True)
     else:
-        st.markdown('<div class="timer">⌛ Time is up. Waiting for the host.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="timer">⌛ Time is up</div>', unsafe_allow_html=True)
+
+
+@st.fragment(run_every=2)
+def reveal_board(key, host=False):
+    """Opened tickets. Players get a laugh button, the host gets a skip button."""
+    with game.lock:
+        shown = [k for k in game.order[: game.reveal_n] if not game.entries[k]["hidden"]]
+        total = len(game.order)
+        n = game.reveal_n
+    if n == 0:
+        msg = "No ticket opened yet. Press “Open next ticket”." if host else \
+              "🥁 Waiting for the host to open the first ticket…"
+        st.markdown(f'<div class="waiting">{msg}</div>', unsafe_allow_html=True)
+        return
+    for k in reversed(shown):
+        e = game.entries[k]
+        st.markdown(ticket_html(e), unsafe_allow_html=True)
+        if host:
+            c1, c2 = st.columns([3, 1])
+            c1.caption(f"😂 {len(e['laughs'])} laughs")
+            c2.button("Skip", key=f"hide_{k}", on_click=game.hide, args=(k,), use_container_width=True)
+        else:
+            mine = key in e["laughs"]
+            st.button(
+                f"😂 {len(e['laughs'])}" + ("  (you laughed)" if mine else ""),
+                key=f"laugh_{k}",
+                on_click=game.toggle_laugh,
+                args=(k, key),
+                type="primary" if mine else "secondary",
+                use_container_width=True,
+            )
+    st.caption(f"{n} of {total} tickets opened")
+
+
+def view_final():
+    if not st.session_state.get("balloons_done"):
+        st.balloons()
+        st.session_state.balloons_done = True
+    with game.lock:
+        entries = [e for e in game.entries.values() if not e["hidden"]]
+    ranked = sorted(entries, key=lambda e: (-len(e["laughs"]), e["number"]))
+    if not ranked:
+        st.info("No tickets to show.")
+        return
+    medals = ["🥇", "🥈", "🥉"]
+    st.markdown('<div class="podium">The funniest tickets</div>', unsafe_allow_html=True)
+    for i, e in enumerate(ranked[:3]):
+        st.markdown(f"**{medals[i]} {len(e['laughs'])} laughs**")
+        st.markdown(ticket_html(e), unsafe_allow_html=True)
+    rest = ranked[3:]
+    if rest:
+        st.markdown('<div class="podium">The rest</div>', unsafe_allow_html=True)
+        for e in rest:
+            st.markdown(f"**{len(e['laughs'])} 😂**")
+            st.markdown(ticket_html(e, mini=True), unsafe_allow_html=True)
 
 
 # --------------------------------------------------------------------------- #
-# Phase views
+# Player views
 # --------------------------------------------------------------------------- #
 @st.fragment(run_every=3)
 def write_progress():
@@ -388,7 +519,7 @@ def answer_board(key):
 
 def view_answer(key):
     countdown()
-    author, entry = game.ticket_for(key)
+    _, entry = game.ticket_for(key)
     if entry is None:
         st.markdown('<div class="waiting">You did not write a question this round, so you are watching.<br>'
                     'Stay here for the reveal.</div>', unsafe_allow_html=True)
@@ -424,181 +555,283 @@ def view_answer(key):
     answer_board(key)
 
 
-@st.fragment(run_every=2)
-def reveal_board(key, is_host):
-    with game.lock:
-        shown = [k for k in game.order[: game.reveal_n] if not game.entries[k]["hidden"]]
-        total = len(game.order)
-        n = game.reveal_n
-    if n == 0:
-        st.markdown('<div class="waiting">🥁 Waiting for the host to open the first ticket…</div>',
-                    unsafe_allow_html=True)
-        return
-    for k in reversed(shown):
-        e = game.entries[k]
-        st.markdown(ticket_html(e), unsafe_allow_html=True)
-        c1, c2 = st.columns([3, 1])
-        mine = key in e["laughs"]
-        c1.button(
-            f"😂 {len(e['laughs'])}" + ("  (you laughed)" if mine else ""),
-            key=f"laugh_{k}",
-            on_click=game.toggle_laugh,
-            args=(k, key),
-            type="primary" if mine else "secondary",
-            use_container_width=True,
-        )
-        if is_host:
-            c2.button("Skip", key=f"hide_{k}", on_click=game.hide, args=(k,), use_container_width=True)
-    st.caption(f"{n} of {total} tickets opened")
+def player_main():
+    name_param = st.query_params.get("p", "")
 
-
-def view_reveal(key, is_host):
-    if is_host:
-        total, n = len(game.order), game.reveal_n
-        label = f"👀 Open next ticket ({n}/{total})" if n < total else "🏆 Show the winners"
-        if st.button(label, type="primary", use_container_width=True):
-            game.reveal_next()
-            st.rerun()
-    reveal_board(key, is_host)
-
-
-def view_final():
-    if not st.session_state.get("balloons_done"):
-        st.balloons()
-        st.session_state.balloons_done = True
-    with game.lock:
-        entries = [e for e in game.entries.values() if not e["hidden"]]
-    ranked = sorted(entries, key=lambda e: (-len(e["laughs"]), e["number"]))
-    if not ranked:
-        st.info("No tickets to show.")
-        return
-    medals = ["🥇", "🥈", "🥉"]
-    st.markdown('<div class="podium">The funniest tickets</div>', unsafe_allow_html=True)
-    for i, e in enumerate(ranked[:3]):
-        st.markdown(f"**{medals[i]} {len(e['laughs'])} laughs**")
-        st.markdown(ticket_html(e), unsafe_allow_html=True)
-    rest = ranked[3:]
-    if rest:
-        st.markdown('<div class="podium">The rest</div>', unsafe_allow_html=True)
-        for e in rest:
-            st.markdown(f"**{len(e['laughs'])} 😂**")
-            st.markdown(ticket_html(e, mini=True), unsafe_allow_html=True)
-
-
-# --------------------------------------------------------------------------- #
-# Host controls
-# --------------------------------------------------------------------------- #
-def host_panel():
-    with st.expander("🎛️ Host controls", expanded=bool(st.session_state.get("is_host"))):
-        if not st.session_state.get("is_host"):
-            with st.form("pin_form"):
-                pin = st.text_input("Host PIN", type="password")
-                if st.form_submit_button("Unlock"):
-                    if pin == host_pin():
-                        st.session_state.is_host = True
-                        st.rerun()
-                    else:
-                        st.error("Wrong PIN.")
-            return
-
-        phase = game.phase
-        label = dict(PHASES)[phase]
-        st.caption(f"You are the host. Current round: **{label}**")
-
-        if phase in ("write", "answer"):
-            c1, c2 = st.columns([1, 1])
-            minutes = c1.number_input("Minutes", min_value=1, max_value=15, value=3, step=1)
-            c2.write("")
-            c2.write("")
-            if c2.button("Start countdown", use_container_width=True):
-                game.start_timer(minutes)
+    # ---- not joined yet ---- #
+    if not name_param:
+        st.markdown("### Who is playing?")
+        if game.locked:
+            st.markdown(f'<div class="lockbox">{LOCK_MSG}<br><small>Already playing? Type your name '
+                        f'again to get back in.</small></div>', unsafe_allow_html=True)
+        with st.form("join_form"):
+            name = st.text_input("Your name", max_chars=30, placeholder="e.g. Amina")
+            go = st.form_submit_button("Join the game", type="primary", use_container_width=True)
+        if go:
+            if not name.strip():
+                st.warning("Enter your name to join.")
+            elif not game.can_join(name):
+                st.error("Joining is closed for now. Please wait for the next round.")
+            else:
+                st.query_params["p"] = " ".join(name.split())
                 st.rerun()
+        watcher()
+        st.divider()
+        if st.button("Host login", use_container_width=True):
+            st.query_params["mode"] = "host"
+            st.rerun()
+        return
 
+    # ---- joined name, but doors are locked ---- #
+    if not game.can_join(name_param):
+        if game.key_of(name_param) in game.kicked:
+            msg = "You were removed from this round by the host. Please wait for the next round."
+        else:
+            msg = LOCK_MSG
+        st.markdown(f'<div class="lockbox">{msg}</div>', unsafe_allow_html=True)
+        watcher()
+        if st.button("Use a different name", use_container_width=True):
+            st.query_params.clear()
+            st.rerun()
+        return
+
+    my_key = game.join(name_param)
+    my_name = game.players[my_key]
+    watcher()
+
+    if game.phase == "write":
+        view_write(my_key)
+    elif game.phase == "answer":
+        view_answer(my_key)
+    elif game.phase == "reveal":
+        reveal_board(my_key)
+    else:
+        view_final()
+
+    st.divider()
+    c1, c2 = st.columns([3, 1])
+    c1.caption(f"Playing as **{my_name}**")
+    if c2.button("Not you?", use_container_width=True):
+        st.query_params.clear()
+        st.rerun()
+
+
+# --------------------------------------------------------------------------- #
+# Host dashboard (the host is not a player)
+# --------------------------------------------------------------------------- #
+@st.fragment(run_every=2)
+def host_stats():
+    with game.lock:
+        joined = len(game.players)
+        saved = sum(1 for e in game.entries.values() if e["question"])
+        answered = sum(1 for e in game.entries.values() if e["answer"])
+        tickets = len(game.entries) if game.phase != "write" else saved
+        opened = game.reveal_n
+        total = len(game.order)
+    c = st.columns(4)
+    c[0].metric("Players", joined)
+    c[1].metric("Questions", saved)
+    c[2].metric("Answers", f"{answered}/{tickets}" if game.phase != "write" else "–")
+    c[3].metric("Opened", f"{opened}/{total}" if game.phase in ("reveal", "final") else "–")
+
+
+@st.fragment(run_every=1)
+def host_tick():
+    """Auto-advance when the countdown ends (only if the host switched that on)."""
+    if (game.auto_advance and game.deadline and time.time() > game.deadline
+            and game.phase in ("write", "answer")):
+        if not game.advance():
+            game.deadline = None
+            game.notice = "Time is up, but at least 2 questions are needed to deal tickets."
+        st.rerun()
+
+
+@st.fragment(run_every=2)
+def host_roster():
+    with game.lock:
+        phase = game.phase
+        rows = []
+        for k, name in game.players.items():
+            e = game.entries.get(k)
+            row = {"Player": name, "Number": f"#{e['number']}" if e else "–"}
+            if phase == "write":
+                row["Status"] = "✅ question saved" if e and e["question"] else ("✍️ writing" if e else "⏳ no number yet")
+            else:
+                _, t = game.ticket_for(k)
+                row["Answering ticket"] = f"#{t['number']}" if t else "–"
+                row["Status"] = ("✅ answered" if t["answer"] else "✍️ answering") if t else "👀 watching"
+            rows.append(row)
+    if rows:
+        st.dataframe(rows, hide_index=True, use_container_width=True)
+    else:
+        st.caption("Nobody has joined yet. Share the app link.")
+
+
+def host_login():
+    st.markdown("### Host login")
+    st.write("The host runs the game from here and does not play.")
+    with st.form("pin_form"):
+        pin = st.text_input("Host PIN", type="password")
+        ok = st.form_submit_button("Log in", type="primary", use_container_width=True)
+    if ok:
+        if pin == host_pin():
+            st.session_state.is_host = True
+            st.rerun()
+        else:
+            st.error("Wrong PIN.")
+    if st.button("Back to the game", use_container_width=True):
+        st.query_params.clear()
+        st.rerun()
+
+
+def host_main():
+    phase = game.phase
+    host_tick()
+    host_stats()
+
+    if game.notice:
+        st.warning(game.notice)
+
+    # ---- round control ---- #
+    with st.container(border=True):
+        st.markdown("### Round")
         if phase == "write":
-            saved = [e for e in game.entries.values() if e["question"]]
-            waiting = [n for k, n in game.players.items()
-                       if k not in game.entries or not game.entries[k]["question"]]
-            st.write(f"**{len(saved)}** questions saved.")
-            if waiting:
-                st.caption("Still writing: " + ", ".join(waiting))
-            if st.button("Close writing and deal tickets", type="primary", use_container_width=True):
+            st.write("Players are drawing numbers and writing their “If…” questions.")
+            if st.button("Close writing and deal tickets ▶", type="primary", use_container_width=True):
                 if game.start_answer():
                     st.rerun()
                 else:
-                    st.warning("At least 2 saved questions are needed to start.")
-
+                    st.warning("At least 2 saved questions are needed to deal tickets.")
+            st.caption("Tickets are dealt automatically so nobody answers their own question. "
+                       "The doors lock when tickets are dealt.")
         elif phase == "answer":
-            waiting = [game.players.get(e["answerer"], "?") for e in game.entries.values() if not e["answer"]]
-            st.write(f"**{len(game.entries) - len(waiting)}** of {len(game.entries)} answered.")
-            if waiting:
-                st.caption("Still answering: " + ", ".join(waiting))
-            if st.button("Start the reveal", type="primary", use_container_width=True):
+            st.write("Tickets are dealt. Players are answering blind.")
+            if st.button("Start the reveal ▶", type="primary", use_container_width=True):
                 game.start_reveal()
                 st.rerun()
-
+            any_answers = any(e["answer"] for e in game.entries.values())
+            if st.button("🔀 Deal tickets again", use_container_width=True, disabled=any_answers):
+                game.deal()
+                st.rerun()
+            if any_answers:
+                st.caption("Dealing again is only possible before the first answer is saved.")
         elif phase == "reveal":
             total, n = len(game.order), game.reveal_n
-            btn = f"👀 Open next ticket ({n}/{total})" if n < total else "🏆 Show the winners"
-            if st.button(btn, type="primary", use_container_width=True, key="host_reveal_next"):
+            label = f"👀 Open next ticket ({n}/{total})" if n < total else "🏆 Show the winners"
+            if st.button(label, type="primary", use_container_width=True):
                 game.reveal_next()
                 st.rerun()
+            reveal_board(None, host=True)
+        else:
+            st.write("The winners are on every screen.")
+            view_final()
 
+    # ---- timer ---- #
+    if phase in ("write", "answer"):
+        with st.container(border=True):
+            st.markdown("### Timer")
+            countdown()
+            c1, c2, c3, c4 = st.columns([1.2, 1.3, 1, 1])
+            minutes = c1.number_input("Minutes", min_value=1, max_value=30, value=3, step=1)
+            c2.write("")
+            c2.write("")
+            if c2.button("▶ Start", use_container_width=True):
+                game.start_timer(minutes)
+                st.rerun()
+            c3.write("")
+            c3.write("")
+            if c3.button("+1 min", use_container_width=True):
+                game.add_time(60)
+                st.rerun()
+            c4.write("")
+            c4.write("")
+            if c4.button("■ Stop", use_container_width=True):
+                game.stop_timer()
+                st.rerun()
+            game.auto_advance = st.checkbox(
+                "Move to the next round automatically when time is up",
+                value=game.auto_advance,
+            )
+
+    # ---- doors ---- #
+    with st.container(border=True):
+        st.markdown("### Doors")
+        if game.locked:
+            st.write("🔒 **Locked.** New players see “wait for the next round”. "
+                     "Players already in can reconnect.")
+            if st.button("🔓 Open the doors", use_container_width=True):
+                game.set_locked(False)
+                st.rerun()
+        else:
+            st.write("🔓 **Open.** Anyone with the link can join.")
+            if st.button("🔒 Lock the doors", use_container_width=True):
+                game.set_locked(True)
+                st.rerun()
+
+    # ---- players ---- #
+    with st.container(border=True):
+        st.markdown("### Players")
+        host_roster()
+        if phase == "write" and game.players:
+            names = {k: n for k, n in game.players.items()}
+            c1, c2 = st.columns([3, 1])
+            who = c1.selectbox("Remove a player", options=list(names), format_func=lambda k: names[k],
+                               index=None, placeholder="Choose a player", label_visibility="collapsed")
+            c2.button("Remove", disabled=who is None, use_container_width=True,
+                      on_click=game.remove_player, args=(who,))
+
+    # ---- question review ---- #
+    if phase == "write":
+        with st.expander("Review questions (spoilers!)"):
+            saved = [(k, e) for k, e in game.entries.items() if e["question"]]
+            if not saved:
+                st.caption("No saved questions yet.")
+            for k, e in saved:
+                c1, c2 = st.columns([4, 1])
+                c1.markdown(f"**#{e['number']}** {esc(e['question'])}  \n<small>{esc(e['name'])}</small>",
+                            unsafe_allow_html=True)
+                c2.button("Clear", key=f"clr_{k}", on_click=game.clear_question, args=(k,),
+                          use_container_width=True)
+            st.caption("Clearing a question asks that player to write a new one.")
+
+    # ---- who has which ticket ---- #
+    if phase == "answer":
+        with st.expander("Who answers which ticket"):
+            rows = []
+            for k, name in game.players.items():
+                _, t = game.ticket_for(k)
+                if t:
+                    rows.append({"Player": name, "Answers ticket": f"#{t['number']}"})
+            st.dataframe(rows, hide_index=True, use_container_width=True)
+
+    # ---- danger zone ---- #
+    with st.expander("More options"):
         if phase != "write":
             if st.button("↩ Go back one round", use_container_width=True):
                 game.back()
                 st.rerun()
-
-        st.divider()
         confirm = st.checkbox("I want to wipe everything and start a new game")
         if st.button("New game", disabled=not confirm, use_container_width=True):
             game.reset()
-            st.session_state.pop("balloons_done", None)
+            st.rerun()
+        if st.button("Log out", use_container_width=True):
+            st.session_state.is_host = False
+            st.query_params.clear()
             st.rerun()
 
 
 # --------------------------------------------------------------------------- #
-# Main
+# Entry point
 # --------------------------------------------------------------------------- #
 st.session_state["snap"] = game.snapshot()
-header()
+is_host_page = st.query_params.get("mode", "") == "host"
+header(host=is_host_page)
 
-name_param = st.query_params.get("p", "")
-if not name_param:
-    st.markdown("### Who is playing?")
-    with st.form("join_form"):
-        name = st.text_input("Your name", max_chars=30, placeholder="e.g. Amina")
-        go = st.form_submit_button("Join the game", type="primary", use_container_width=True)
-    if go:
-        if name.strip():
-            st.query_params["p"] = " ".join(name.split())
-            st.rerun()
-        else:
-            st.warning("Enter your name to join.")
-    host_panel()
-    st.stop()
-
-my_key = game.join(name_param)
-my_name = game.players[my_key]
-is_host = bool(st.session_state.get("is_host"))
-
-watcher()
-
-phase = game.phase
-if phase == "write":
-    view_write(my_key)
-elif phase == "answer":
-    view_answer(my_key)
-elif phase == "reveal":
-    view_reveal(my_key, is_host)
+if is_host_page:
+    if st.session_state.get("is_host"):
+        host_main()
+    else:
+        host_login()
 else:
-    view_final()
-
-st.divider()
-c1, c2 = st.columns([3, 1])
-c1.caption(f"Playing as **{my_name}**")
-if c2.button("Not you?", use_container_width=True):
-    st.query_params.clear()
-    st.rerun()
-
-host_panel()
+    player_main()
 
